@@ -1,11 +1,87 @@
 AWSTemplateFormatVersion: 2010-09-09
+# CHANGED: Description updated (lab: "Demonstrates how to reference resources from a different stack.
+# This template provisions an EC2 instance in a VPC Subnet provisioned in a different stack.")
 Description: >-
-  Application Template: Demonstrates how to reference resources from a different stack.
-  This template provisions an EC2 instance in a VPC Subnet provisioned in a different stack.
+  Application Template: Highly available and auto scaling cafe application
+  (bastion host, Application Load Balancer, launch template, Auto Scaling group,
+  RDS Multi-AZ database and app settings in Secrets Manager).
+  Uses the VPC and subnets exported by the network stack (lab-network).
 
 # This template creates:
-#   Amazon EC2 instance
-#   Security Group
+#   Security Groups (bastion, load balancer, app servers, database)
+#   Bastion host (SSH allowed only from your workstation IP)
+#   IAM role + instance profile for the app servers
+#   RDS MariaDB database (Multi-AZ) + DB subnet group
+#   Secrets Manager secrets read by the cafe app (<SecretsPrefix>/dbUrl, dbName, ...)
+#   Application Load Balancer + target group + listener
+#   Launch template + Auto Scaling group + CPU target tracking scaling policy
+#
+# ---------------------------------------------------------------------------------------------
+# CHANGE LOG (compared with the original lab-application.yaml from the class lab)
+#   ADDED:   Metadata section that groups the parameters in the CloudFormation console
+#   KEPT:    NetworkStackName parameter and the Fn::ImportValue cross-stack pattern
+#   CHANGED: AmazonLinuxAMIID parameter -> BastionAMIID (Amazon Linux 2023 instead of Amazon Linux 2)
+#   ADDED:   22 parameters - WorkstationIP, MinSize, MaxSize (required by the assignment) and
+#            KeyName, AMI/instance types, scaling target, health check path, database and app settings
+#   ADDED:   Conditions section (RestoreFromSnapshot)
+#   REMOVED: WebServerInstance (single public web server installed with cfn-init) -> replaced by
+#            the launch template + Auto Scaling group + Application Load Balancer
+#   REMOVED: DiskVolume + DiskMountPoint (100 GiB data volume, not used by the cafe app)
+#   REMOVED: WebServerSecurityGroup (HTTP from anywhere) -> replaced by 4 layered security groups
+#   ADDED:   BastionSecurityGroup (SSH only from WorkstationIP), LoadBalancerSecurityGroup,
+#            AppServerSecurityGroup, DatabaseSecurityGroup
+#   ADDED:   BastionHost, AppServerRole, AppServerInstanceProfile
+#   ADDED:   DBSubnetGroup + CafeDatabase (RDS MariaDB, Multi-AZ, optional restore from snapshot)
+#   ADDED:   7 Secrets Manager secrets read by the cafe app
+#   ADDED:   LoadBalancer, AppTargetGroup, HTTPListener
+#   ADDED:   AppLaunchTemplate, AppAutoScalingGroup, CPUScalingPolicy
+#   CHANGED: URL output now points to the load balancer (lab: public DNS of the single web server)
+#   ADDED:   LoadBalancerDNSName, BastionPublicIP, DatabaseEndpoint and AutoScalingGroupName outputs
+# ---------------------------------------------------------------------------------------------
+
+# ADDED: Metadata - groups and orders the parameters on the CloudFormation console "Specify stack details" page
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Network
+        Parameters:
+          - NetworkStackName
+          - WorkstationIP
+      - Label:
+          default: EC2 instances
+        Parameters:
+          - KeyName
+          - AppAMIID
+          - AppInstanceType
+          - BastionAMIID
+          - BastionInstanceType
+      - Label:
+          default: Auto Scaling
+        Parameters:
+          - MinSize
+          - MaxSize
+          - DesiredCapacity
+          - CPUTargetValue
+          - HealthCheckPath
+      - Label:
+          default: Database
+        Parameters:
+          - DBInstanceClass
+          - DBEngineVersion
+          - DBAllocatedStorage
+          - DBMultiAZ
+          - DBName
+          - DBUsername
+          - DBPassword
+          - DBSnapshotIdentifier
+      - Label:
+          default: Cafe application settings
+        Parameters:
+          - SecretsPrefix
+          - Currency
+          - TimeZone
+          - ShowServerInfo
 
 ######################
 # Parameters section
@@ -13,98 +89,259 @@ Description: >-
 
 Parameters:
 
+  ## Network
+
+  # Kept from the lab (unchanged): name of the network stack whose exports are imported
   NetworkStackName:
     Description: >-
       Name of an active CloudFormation stack that contains the networking
-      resources, such as the VPC and subnet that will be used in this stack.
+      resources, such as the VPC and subnets that will be used in this stack.
     Type: String
     MinLength: 1
     MaxLength: 255
     AllowedPattern: '^[a-zA-Z][-a-zA-Z0-9]*$'
     Default: lab-network
 
-  AmazonLinuxAMIID:
+  # ADDED (assignment requirement): workstation IP - the bastion host only accepts SSH from this address
+  WorkstationIP:
+    Description: >-
+      Public IP address of your workstation in CIDR notation, e.g. 203.0.113.25/32.
+      The bastion host only accepts SSH from this address.
+      (Find your IP at https://checkip.amazonaws.com and add /32.)
+    Type: String
+    AllowedPattern: '^(\d{1,3}\.){3}\d{1,3}/(\d|[12]\d|3[0-2])$'
+    ConstraintDescription: Must be an IP address in CIDR notation, e.g. 203.0.113.25/32
+
+  ## EC2 instances
+
+  # ADDED: key pair for SSH (the lab instance had no key pair)
+  KeyName:
+    Description: Existing EC2 key pair used to SSH into the bastion and app servers
+    Type: AWS::EC2::KeyPair::KeyName
+
+  # ADDED: AMI of the cafe app servers (custom AMI from the previous assignment)
+  AppAMIID:
+    Description: AMI of the cafe web server (the cafe-app-ami created in the previous assignment)
+    Type: AWS::EC2::Image::Id
+    Default: ami-0c9a853f2177ce3a9
+
+  # ADDED: instance type of the app servers (lab: hard-coded t2.micro)
+  AppInstanceType:
+    Description: Instance type of the cafe app servers
+    Type: String
+    Default: t3.micro
+    AllowedValues:
+      - t2.micro
+      - t3.micro
+      - t3.small
+      - t3.medium
+
+  # CHANGED: replaces the lab parameter AmazonLinuxAMIID; now used for the bastion host and
+  # points to Amazon Linux 2023 (lab: /aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2)
+  BastionAMIID:
+    Description: AMI of the bastion host (latest Amazon Linux 2023 by default)
     Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
-    Default: /aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+
+  # ADDED: instance type of the bastion host
+  BastionInstanceType:
+    Description: Instance type of the bastion host
+    Type: String
+    Default: t3.micro
+    AllowedValues:
+      - t2.micro
+      - t3.micro
+      - t3.small
+
+  ## Auto Scaling
+
+  # ADDED (assignment requirement): minimum size of the Auto Scaling group
+  MinSize:
+    Description: Minimum number of app servers in the Auto Scaling group
+    Type: Number
+    Default: 2
+    MinValue: 1
+
+  # ADDED (assignment requirement): maximum size of the Auto Scaling group
+  MaxSize:
+    Description: Maximum number of app servers in the Auto Scaling group (must be >= MinSize)
+    Type: Number
+    Default: 4
+    MinValue: 1
+
+  # ADDED: number of app servers started when the stack is created
+  DesiredCapacity:
+    Description: Number of app servers to start with (between MinSize and MaxSize)
+    Type: Number
+    Default: 2
+    MinValue: 1
+
+  # ADDED: CPU % the target tracking scaling policy keeps
+  CPUTargetValue:
+    Description: Average CPU utilization (%) the Auto Scaling group tries to keep
+    Type: Number
+    Default: 50
+    MinValue: 10
+    MaxValue: 90
+
+  # ADDED: path used by the load balancer health check
+  HealthCheckPath:
+    Description: Path the load balancer requests to check that an app server is healthy
+    Type: String
+    Default: /cafe/
+
+  ## Database
+
+  # ADDED: size of the RDS instance
+  DBInstanceClass:
+    Description: RDS instance class
+    Type: String
+    Default: db.t3.micro
+    AllowedValues:
+      - db.t3.micro
+      - db.t3.small
+      - db.t4g.micro
+      - db.t4g.small
+
+  # ADDED: MariaDB version
+  DBEngineVersion:
+    Description: MariaDB engine version (ignored when restoring from a snapshot)
+    Type: String
+    Default: '10.6'
+
+  # ADDED: database storage size
+  DBAllocatedStorage:
+    Description: Database storage in GiB
+    Type: Number
+    Default: 20
+    MinValue: 20
+    MaxValue: 1000
+
+  # ADDED: Multi-AZ on/off (true = standby database in the second AZ)
+  DBMultiAZ:
+    Description: true = standby copy of the database in the second AZ (high availability)
+    Type: String
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+  # ADDED: database name used by the cafe app
+  DBName:
+    Description: Name of the cafe database
+    Type: String
+    Default: cafe_db
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9_]*$'
+    MaxLength: 64
+
+  # ADDED: database user
+  DBUsername:
+    Description: Database master user name
+    Type: String
+    Default: admin
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9_]*$'
+    MaxLength: 16
+
+  # ADDED: database password - NoEcho hides it in the console, CLI output and events
+  DBPassword:
+    Description: >-
+      Database master password (8-41 characters, no spaces, quotes, @, / or \).
+      When restoring from a snapshot, use the password of the original database.
+    Type: String
+    NoEcho: true
+    MinLength: 8
+    MaxLength: 41
+    AllowedPattern: '^[^\s"''@/\\]*$'
+    ConstraintDescription: 8-41 characters, no spaces, quotes, @, / or \
+
+  # ADDED: optional snapshot to restore, so the new database already contains the menu and orders
+  DBSnapshotIdentifier:
+    Description: >-
+      Optional. Snapshot (name or ARN) to restore the database from, e.g. a snapshot of
+      the previous cafe-db, so the menu and orders are already loaded.
+      Leave empty to create a new, empty database.
+    Type: String
+    Default: ''
+
+  ## Cafe application settings
+
+  # ADDED: prefix of the secrets read by the app; a different prefix allows a second copy of the app in the same account
+  SecretsPrefix:
+    Description: >-
+      Prefix of the Secrets Manager secrets read by the app. Use a different prefix
+      (e.g. /cafe-test) to run a second copy of the app in the same account and region.
+    Type: String
+    Default: /cafe
+    AllowedPattern: '^/[a-zA-Z0-9_-]+$'
+
+  # ADDED: cafe app setting stored in <SecretsPrefix>/currency
+  Currency:
+    Description: Currency symbol shown on the menu
+    Type: String
+    Default: '$'
+
+  # ADDED: cafe app setting stored in <SecretsPrefix>/timeZone
+  TimeZone:
+    Description: Time zone used for order times (PHP time zone name)
+    Type: String
+    Default: America/New_York
+
+  # ADDED: cafe app setting stored in <SecretsPrefix>/showServerInfo
+  ShowServerInfo:
+    Description: Show which server and AZ handled the request (useful to test load balancing)
+    Type: String
+    Default: 'false'
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+######################
+# Conditions section
+######################
+
+# ADDED: Conditions section - restore the database from a snapshot only when DBSnapshotIdentifier is not empty
+Conditions:
+  RestoreFromSnapshot: !Not [!Equals [!Ref DBSnapshotIdentifier, '']]
 
 ######################
 # Resources section
 ######################
 
+# REMOVED: WebServerInstance (lab) - one EC2 web server in the public subnet, configured with
+#          cfn-init/cfn-signal and a sample index.html. Replaced by AppLaunchTemplate + AppAutoScalingGroup
+#          (app servers in private subnets behind the load balancer, using the cafe-app-ami).
+# REMOVED: DiskVolume and DiskMountPoint (lab) - a 100 GiB EBS data volume attached to the web server;
+#          the cafe app keeps its data in RDS, so the volume is not needed.
+# REMOVED: WebServerSecurityGroup (lab) - HTTP from 0.0.0.0/0 directly to the instance. Replaced by the
+#          four security groups below (internet -> load balancer -> app servers -> database).
+
 Resources:
 
-  WebServerInstance:
-    Type: AWS::EC2::Instance
-    Metadata:
-      'AWS::CloudFormation::Init':
-        configSets:
-          All:
-            - ConfigureSampleApp
-        ConfigureSampleApp:
-          packages:
-            yum:
-              httpd: []
-          files:
-            /var/www/html/index.html:
-              content: |
-                <img src="https://s3.amazonaws.com/cloudformation-examples/cloudformation_graphic.png" alt="AWS CloudFormation Logo"/>
-                <h1>Congratulations, you have successfully launched the AWS CloudFormation sample.</h1>
-              mode: 000644
-              owner: apache
-              group: apache
-          services:
-            sysvinit:
-              httpd:
-                enabled: true
-                ensureRunning: true
-    Properties:
-      InstanceType: t2.micro
-      ImageId: !Ref AmazonLinuxAMIID
-      NetworkInterfaces:
-        - GroupSet:
-            - !Ref WebServerSecurityGroup
-          AssociatePublicIpAddress: true
-          DeviceIndex: 0
-          DeleteOnTermination: true
-          SubnetId:
-            Fn::ImportValue:
-              !Sub ${NetworkStackName}-SubnetID
-      Tags:
-        - Key: Name
-          Value: Web Server
-      UserData:
-        Fn::Base64: !Sub |
-          #!/bin/bash -xe
-          yum update -y aws-cfn-bootstrap
-          # Install the files and packages from the metadata
-          /opt/aws/bin/cfn-init -v --stack ${AWS::StackName} --resource WebServerInstance --configsets All --region ${AWS::Region}
-          # Signal the status from cfn-init
-          /opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackName} --resource WebServerInstance --region ${AWS::Region}
-    CreationPolicy:
-      ResourceSignal:
-        Timeout: PT5M
+  ## Security Groups
 
-  DiskVolume:
-    Type: AWS::EC2::Volume
-    Properties:
-      Size: 100
-      AvailabilityZone: !GetAtt WebServerInstance.AvailabilityZone
-      Tags:
-        - Key: Name
-          Value: Web Data
-    DeletionPolicy: Snapshot
-
-  DiskMountPoint:
-    Type: AWS::EC2::VolumeAttachment
-    Properties:
-      InstanceId: !Ref WebServerInstance
-      VolumeId: !Ref DiskVolume
-      Device: /dev/sdh
-
-  WebServerSecurityGroup:
+  # ADDED (assignment requirement): bastion security group - SSH only from the WorkstationIP parameter
+  BastionSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
-      GroupDescription: Enable HTTP ingress
+      GroupDescription: Allow SSH only from the workstation IP
+      VpcId:
+        Fn::ImportValue:
+          !Sub ${NetworkStackName}-VPCID
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref WorkstationIP
+          Description: SSH from workstation
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-bastion-sg'
+
+  # ADDED: load balancer security group - HTTP from the internet
+  LoadBalancerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow HTTP from the internet to the load balancer
       VpcId:
         Fn::ImportValue:
           !Sub ${NetworkStackName}-VPCID
@@ -113,15 +350,361 @@ Resources:
           FromPort: 80
           ToPort: 80
           CidrIp: 0.0.0.0/0
+          Description: HTTP from anywhere
       Tags:
         - Key: Name
-          Value: Web Server Security Group
+          Value: !Sub '${AWS::StackName}-alb-sg'
+
+  # ADDED: app server security group - HTTP only from the load balancer, SSH only from the bastion
+  AppServerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow HTTP from the load balancer and SSH from the bastion
+      VpcId:
+        Fn::ImportValue:
+          !Sub ${NetworkStackName}-VPCID
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourceSecurityGroupId: !Ref LoadBalancerSecurityGroup
+          Description: HTTP from the load balancer
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          SourceSecurityGroupId: !Ref BastionSecurityGroup
+          Description: SSH from the bastion host
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-app-server-sg'
+
+  # ADDED: database security group - MariaDB (3306) only from the app servers and the bastion
+  DatabaseSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow MySQL/MariaDB from the app servers and the bastion
+      VpcId:
+        Fn::ImportValue:
+          !Sub ${NetworkStackName}-VPCID
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          SourceSecurityGroupId: !Ref AppServerSecurityGroup
+          Description: MariaDB from the app servers
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          SourceSecurityGroupId: !Ref BastionSecurityGroup
+          Description: MariaDB from the bastion host (administration)
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-db-sg'
+
+  ## Bastion host
+
+  # ADDED: bastion host in public subnet AZ1 - the only way to SSH into the private app servers
+  BastionHost:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref BastionAMIID
+      InstanceType: !Ref BastionInstanceType
+      KeyName: !Ref KeyName
+      # uses the new PublicSubnet1ID export of the network stack (lab used <stack>-SubnetID)
+      SubnetId:
+        Fn::ImportValue:
+          !Sub ${NetworkStackName}-PublicSubnet1ID
+      SecurityGroupIds:
+        - !Ref BastionSecurityGroup
+      # requires IMDSv2 tokens for the instance metadata service (security best practice)
+      MetadataOptions:
+        HttpTokens: required
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-bastion'
+
+  ## IAM role for the app servers (read the cafe secrets + Session Manager)
+
+  # ADDED: IAM role of the app servers - read only the <SecretsPrefix>/* secrets, plus Systems Manager access
+  AppServerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore'
+      Policies:
+        - PolicyName: read-cafe-secrets
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                  - secretsmanager:DescribeSecret
+                Resource: !Sub 'arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${SecretsPrefix}/*'
+
+  # ADDED: instance profile that attaches AppServerRole to the app servers
+  AppServerInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref AppServerRole
+
+  ## Database (RDS MariaDB, Multi-AZ)
+
+  # ADDED: DB subnet group with the two private DB subnets exported by the network stack
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Private database subnets in two Availability Zones
+      SubnetIds:
+        - Fn::ImportValue: !Sub ${NetworkStackName}-DBSubnet1ID
+        - Fn::ImportValue: !Sub ${NetworkStackName}-DBSubnet2ID
+
+  # ADDED: cafe database - RDS MariaDB, Multi-AZ, new or restored from a snapshot
+  CafeDatabase:
+    Type: AWS::RDS::DBInstance
+    # Keep a final snapshot if the stack is deleted, so data is never lost by accident
+    DeletionPolicy: Snapshot
+    UpdateReplacePolicy: Snapshot
+    Properties:
+      Engine: mariadb
+      # engine version, name, user and password come from the snapshot when restoring, so they are omitted (AWS::NoValue)
+      EngineVersion: !If [RestoreFromSnapshot, !Ref 'AWS::NoValue', !Ref DBEngineVersion]
+      DBInstanceClass: !Ref DBInstanceClass
+      AllocatedStorage: !Ref DBAllocatedStorage
+      StorageType: gp3
+      MultiAZ: !Ref DBMultiAZ
+      DBSnapshotIdentifier: !If [RestoreFromSnapshot, !Ref DBSnapshotIdentifier, !Ref 'AWS::NoValue']
+      DBName: !If [RestoreFromSnapshot, !Ref 'AWS::NoValue', !Ref DBName]
+      MasterUsername: !If [RestoreFromSnapshot, !Ref 'AWS::NoValue', !Ref DBUsername]
+      # Read the password from Secrets Manager (dynamic reference) instead of the parameter
+      MasterUserPassword: !If
+        - RestoreFromSnapshot
+        - !Ref 'AWS::NoValue'
+        - !Sub '{{resolve:secretsmanager:${DBPasswordSecret}}}'
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      VPCSecurityGroups:
+        - !Ref DatabaseSecurityGroup
+      PubliclyAccessible: false
+      BackupRetentionPeriod: 1
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-cafe-db'
+
+  ## Secrets read by the cafe app (see getAppParameters.php)
+
+  # ADDED: <SecretsPrefix>/dbUrl - database endpoint, filled automatically from CafeDatabase
+  DBUrlSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub '${SecretsPrefix}/dbUrl'
+      Description: Endpoint of the cafe database
+      SecretString: !GetAtt CafeDatabase.Endpoint.Address
+
+  # ADDED: <SecretsPrefix>/dbName
+  DBNameSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub '${SecretsPrefix}/dbName'
+      Description: Name of the cafe database
+      SecretString: !Ref DBName
+
+  # ADDED: <SecretsPrefix>/dbUser
+  DBUserSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub '${SecretsPrefix}/dbUser'
+      Description: Cafe database user
+      SecretString: !Ref DBUsername
+
+  # ADDED: <SecretsPrefix>/dbPassword (also used by CafeDatabase through a dynamic reference)
+  DBPasswordSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub '${SecretsPrefix}/dbPassword'
+      Description: Cafe database password
+      SecretString: !Ref DBPassword
+
+  # ADDED: <SecretsPrefix>/currency
+  CurrencySecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub '${SecretsPrefix}/currency'
+      Description: Currency symbol shown by the cafe app
+      SecretString: !Ref Currency
+
+  # ADDED: <SecretsPrefix>/timeZone
+  TimeZoneSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub '${SecretsPrefix}/timeZone'
+      Description: Time zone used by the cafe app
+      SecretString: !Ref TimeZone
+
+  # ADDED: <SecretsPrefix>/showServerInfo
+  ShowServerInfoSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub '${SecretsPrefix}/showServerInfo'
+      Description: Whether the cafe app shows server information
+      SecretString: !Ref ShowServerInfo
+
+  ## Application Load Balancer
+
+  # ADDED: internet-facing Application Load Balancer in both public subnets (one per AZ)
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Type: application
+      Scheme: internet-facing
+      Subnets:
+        - Fn::ImportValue: !Sub ${NetworkStackName}-PublicSubnet1ID
+        - Fn::ImportValue: !Sub ${NetworkStackName}-PublicSubnet2ID
+      SecurityGroups:
+        - !Ref LoadBalancerSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-alb'
+
+  # ADDED: target group of the app servers with an HTTP health check on HealthCheckPath
+  AppTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      VpcId:
+        Fn::ImportValue:
+          !Sub ${NetworkStackName}-VPCID
+      Protocol: HTTP
+      Port: 80
+      TargetType: instance
+      HealthCheckPath: !Ref HealthCheckPath
+      HealthCheckIntervalSeconds: 30
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 5
+      Matcher:
+        HttpCode: '200'
+      # shorter deregistration delay so scale-in is faster
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: '30'
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-tg'
+
+  # ADDED: HTTP:80 listener that forwards all requests to the target group
+  HTTPListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Protocol: HTTP
+      Port: 80
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref AppTargetGroup
+
+  ## Launch template
+
+  # ADDED: launch template of the app servers (cafe-app-ami, instance profile, app server security group)
+  AppLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData:
+        ImageId: !Ref AppAMIID
+        InstanceType: !Ref AppInstanceType
+        KeyName: !Ref KeyName
+        IamInstanceProfile:
+          Arn: !GetAtt AppServerInstanceProfile.Arn
+        SecurityGroupIds:
+          - !Ref AppServerSecurityGroup
+        MetadataOptions:
+          HttpTokens: required   # the app already uses IMDSv2 tokens
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            # The cafe app reads its settings from secrets named /cafe/...
+            # Point it at this stack's secrets (no change when SecretsPrefix is /cafe).
+            sed -i "s#'/cafe/#'${SecretsPrefix}/#g" /var/www/html/cafe/getAppParameters.php
+
+  ## Auto Scaling group
+
+  # ADDED: Auto Scaling group in the two private app subnets, registered with the load balancer
+  AppAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    # Start the app servers only once the database and its settings exist
+    DependsOn:
+      - DBUrlSecret
+      - DBNameSecret
+      - DBUserSecret
+      - DBPasswordSecret
+      - CurrencySecret
+      - TimeZoneSecret
+      - ShowServerInfoSecret
+    Properties:
+      LaunchTemplate:
+        LaunchTemplateId: !Ref AppLaunchTemplate
+        Version: !GetAtt AppLaunchTemplate.LatestVersionNumber
+      # group size comes from the MinSize / MaxSize / DesiredCapacity parameters
+      MinSize: !Ref MinSize
+      MaxSize: !Ref MaxSize
+      DesiredCapacity: !Ref DesiredCapacity
+      VPCZoneIdentifier:
+        - Fn::ImportValue: !Sub ${NetworkStackName}-AppSubnet1ID
+        - Fn::ImportValue: !Sub ${NetworkStackName}-AppSubnet2ID
+      TargetGroupARNs:
+        - !Ref AppTargetGroup
+      # replace instances that fail the load balancer health check
+      HealthCheckType: ELB
+      HealthCheckGracePeriod: 300
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-app'
+          PropagateAtLaunch: true
+
+  # ADDED: target tracking scaling policy - keeps the average CPU of the group at CPUTargetValue %
+  CPUScalingPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AutoScalingGroupName: !Ref AppAutoScalingGroup
+      PolicyType: TargetTrackingScaling
+      TargetTrackingConfiguration:
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ASGAverageCPUUtilization
+        TargetValue: !Ref CPUTargetValue
 
 ######################
 # Outputs section
 ######################
 
 Outputs:
+
+  # CHANGED: URL now points to the cafe app behind the load balancer
+  # (lab: http://<public DNS of WebServerInstance>)
   URL:
-    Description: URL of the sample website
-    Value: !Sub 'http://${WebServerInstance.PublicDnsName}'
+    Description: URL of the cafe website (through the load balancer)
+    Value: !Sub 'http://${LoadBalancer.DNSName}/cafe/'
+
+  # ADDED: DNS name of the load balancer
+  LoadBalancerDNSName:
+    Description: DNS name of the Application Load Balancer
+    Value: !GetAtt LoadBalancer.DNSName
+
+  # ADDED: public IP of the bastion host (for SSH)
+  BastionPublicIP:
+    Description: Public IP of the bastion host (ssh -i <key>.pem ec2-user@<this IP>)
+    Value: !GetAtt BastionHost.PublicIp
+
+  # ADDED: endpoint of the RDS database
+  DatabaseEndpoint:
+    Description: Endpoint of the cafe database
+    Value: !GetAtt CafeDatabase.Endpoint.Address
+
+  # ADDED: name of the Auto Scaling group (used by the verification commands)
+  AutoScalingGroupName:
+    Description: Name of the Auto Scaling group
+    Value: !Ref AppAutoScalingGroup
